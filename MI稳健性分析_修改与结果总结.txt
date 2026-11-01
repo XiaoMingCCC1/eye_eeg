@@ -1,0 +1,394 @@
+MI 稳健性分析：修改与结果总结
+生成时间：2026-10-27（全量 run 已于 14:08:34 完成，退出码 0；见第五节）
+更新时间：2026-10-28（新增第八节"结果在哪里 + 核心数值"）
+依据规范：f:\eye_eeg\mi_robustness_analysis_protocol.md（242 行，未改动）
+主脚本：f:\eye_eeg\ouhe\mi_robustness_analysis.py（1917 行）
+
+====================================================================
+一、任务与范围
+====================================================================
+上一轮基于旧文件 required_calculation_steps(1).md 的全部改动已被撤销，
+本轮严格按 mi_robustness_analysis_protocol.md 重写并实跑，交付：
+  (1) 实验一 等长片段分析（native_equal 等 8 个设置）
+  (2) 实验二 替代数据分析与检验（循环移位参考 + mi_excess + TTS）
+  (3) 实验三 敏感性分析（片段位置前/中/后、k=5/10、全体共同长度）
+  (4) 文字说明一：时间对齐验证
+  (5) 文字说明二：样本缺失解释
+另加三类图与自检报告。
+
+所有统计单位 = 被试；三条件（negative/neutral/positive）每人必须点数、
+步长完全一致；区域统计量 = 区域内通道算术平均；MI 估计器主分析用 KSG
+（k=3），旧实现（10 bin 直方图）单独作为 legacy_same_cohort 复原，两者
+不混为同一基准。
+
+====================================================================
+二、代码修改明细（13 处，均写入 mi_robustness_analysis.py）
+====================================================================
+
+[1] 删除 stage_run 内重复且语义不一致的闭包 region_means
+    问题：该闭包用 np.nanmean，与顶层 reg_mean（要求全有限）语义不同，
+          且与 reg_mean_many 功能重复，容易在不同调用点产生不同区域均值。
+    修改：删除闭包，所有调用点改为 reg_mean / reg_mean_many。
+    结果：区域均值只有一个实现，自检中"由通道输出复算区域均值"可直接
+          对上（见第四节 4.4，差 ~2e-12）。
+
+[2] 修复 tts_subject 的转置错误
+    问题：reg_mean_many(per.T, masks, ...) 的输入形状与被积函数要求的
+          (通道, 点数) 相反，TTS 的 θ 会算错或直接报形状错误。
+    修改：改为 reg_mean_many(per, masks, np.all(np.isfinite(per), axis=0))。
+    结果：θ 形状正确，tts_theta.csv 中 d 从 -r 到 +r 共 2r+1 行。
+
+[3] 补齐输出列常量（保证 14 项交付表头固定）
+    新增 SUR_SUM_COLS(16 列)、SUR_QC_COLS(16 列)、THETA_COLS(7 列)、
+    TTS_COLS(18 列)、COND_SUM_COLS(8 列)、TEST_COLS(23 列)、
+    COHORT_COLS(11 列)、MATCH_COLS(5 列)。
+    结果：所有 CSV 表头在运行前即确定，不随被试是否可评估而变化。
+
+[4] 新增人口学读取 load_demographics()
+    读取 f:\eye_eeg\MIPDB_PublicFile.csv 的 ID / Age / Sex，缺测保持 NaN，
+    不做插补；派生 age_group（<18 / ≥18）。
+    结果：cohort_manifest.csv 每行都有 age / sex / age_group，供文字
+          说明二使用。
+
+[5] 重写 stage_run 的初始化：流式写盘 + 运行日志 + 状态容器
+    - surrogate_values.csv / coupling_channel_values.csv / tts_theta.csv
+      改为边算边写（这三个表在 38 人规模下是百万级行，不能留在内存）。
+    - run_log.txt 每行 flush，记录每个设置的可用人数、排除数、耗时。
+    - 新增 sur_draw（图 2 用）、obs_by_setting / ids_by_setting /
+      excl_by_setting、pos_starts / starts_all / npz_payload 等容器。
+    结果：运行中可随时查看 run_log.txt 与三个大表的大小增长；
+          当前 surrogate_values.csv 已达 25 MB，coupling_channel_values.csv
+          6.5 MB，tts_theta.csv 7.3 MB。
+
+[6] cohort_manifest 记录可用性 + 三位置窗口起止
+    每人记录 available / n_points / n_channels / channel_set_id /
+    age / sex / age_group / reason；位置设置另存 early/middle/late 起点。
+    结果：任何被排除的人都能在表里查到原因，不需要回看控制台。
+
+[7] 重写按条件的信号提取与替代计算（本轮最关键的修改）
+    原状：三条件在循环内各自算、移位集合 m 被条件循环反复覆盖，且
+          "三条件总点数不一致"没有被强制检查。
+    现逻辑：
+      a. 先收集三条件的可用连续区间，求 m_used = max(三条件各自最小移位)；
+      b. S = {s: 1 ≤ s ≤ n_i-1 且 min(s, n_i-s) ≥ m_used}，三条件共用同一 S；
+      c. 若 S 为空 → 整名被试标 not_evaluable，写原因，回滚 cohort 行与
+         所有起点记录，不进入任何统计（规范 L83）；
+      d. 每条件分别算 MI 与替代值，观测值用 reg_mean、替代值用
+         reg_mean_many，三条件结果分条件保存，不再互相覆盖；
+      e. 逐通道写 coupling_channel_values.csv；逐区域写 coupling_values.csv；
+         逐移位×区域写 surrogate_values.csv；native_equal 的 y/t/offset/
+         exponent/瞳孔有效与插值标记/起点/通道号存入 paired_inputs.npz。
+    结果：native_equal、k5、k10 三套设置 38/38 人全部可评估（见第六节）。
+
+[8] 敏感性与耦合表的列定义扩写
+    SENS_COLS 增加 baseline / test / n_subjects / median_paired_difference /
+    ci_low / ci_high / p_raw / p_adjusted / status / reason / note；
+    新增 COUPLING_COLS（13 列，含 n_channels / channel_set_id / k_neighbors）。
+    结果：敏感性表可直接读到"与哪个基准比、共同样本几人、为什么不可算"。
+
+[9] CONFIG 新增 bh_nan_rule
+    明确写死：家族内实际计算的行，不可算 p 在 BH 内部以 1 占位以保持 m 守恒，
+    占位个数写进该家族每行 reason；整个家族一个 p 都算不出时，家族标
+    "<family>_not_computed"，校正 p 留空，绝不填 1 冒充完成（规范 L174）。
+    结果：condition_tests.csv 中 p_adjusted_orig 恒为空、
+          status_orig = family_pending，符合"原 48/144 家族待完成"的要求。
+
+[10] 补齐 stage_run 收尾：条件统计、配对检验、四类 BH、敏感性配对、落盘
+    - V[(analysis, metric, parameter, region, condition)] = 被试向量（保留 NaN）
+    - Friedman + Kendall's W；三组对比（neg-neu / neg-pos / neu-pos）双侧
+      Wilcoxon，2000 次被试层 bootstrap 中位数 95% CI
+    - 家族：mi_only_12_overall / mi_only_36_paired /
+            mi_excess12_overall / mi_excess36_paired 分别 BH-FDR；
+            原稿 48 总体 + 144 配对只打 family_pending，不填数
+    - sensitivity_summary：每个非 native_equal 设置与 native_equal 按共同
+      被试配对，逐 条件×参数×区域 做配对检验，并在该设置内单独 BH
+    - 写出 10 个 CSV + paired_inputs.npz
+    结果：两被试试跑时 Friedman/Wilcoxon 因 n<5、n<3 正确标 not_evaluable；
+          38 人全量运行后将有真实统计量（当前仍在跑）。
+
+[11] 新增 make_figures / stage_selfcheck / main
+    - make_figures：图1 片段时间轴（每被试三条件有效区间 + 各设置窗口）、
+      图2 观测 MI 在替代分布中的位置（prefrontal×offset，箱线 + 红点）、
+      图3 敏感性森林图（配对差值 + 95% CI）；标题/图例标 N、点数、指标名。
+    - stage_selfcheck：9 项核查写 selfcheck_report.json。
+    - main：argparse 子命令 inventory / probe / run / selfcheck，
+      --out / --subjects / --settings。
+    结果：CLI 可用；自检在两被试数据上 all_pass。
+
+[12] 修复 legacy_hist_mi_channels 的广播错误（本轮实际报错点）
+    问题：np.linspace(Xz.min(1), Xz.max(1), bins) 的 x1/x2 是形状 (C,) 的
+          逐通道端点，np.linspace 返回 (bins, C)，随后
+          (Xz[:, :, None] >= ex[:, None, :]) 维度错位，10 bin 直方图版的
+          MI 完全不可用（首次 run 直接抛 ValueError）。
+    修改：改为逐通道端点显式构造分箱边界
+          frac = linspace(0,1,bins)
+          ex = Xz.min(1)[:,None] + (Xz.max(1)-Xz.min(1))[:,None]*frac[None,:]
+          再 (Xz[:,:,None] >= ex[:,None,:]).sum(2)，y 同理。
+    验证：与"逐通道 for 循环调用原实现"的独立复算逐元素对拍，
+          最大绝对差 = 0（5 通道、60 点、固定随机种子）。
+    结果：legacy_same_cohort 与提交稿的 bins=10 + digitize + histogram2d +
+          log2 实现完全一致（含不裁剪负值）。
+
+[13] 两处收尾修正
+    a. "done: ..." 日志原先写在 f_log.close() 之后 → ValueError:
+       I/O operation on closed file（首次完整试跑暴露）。已把该行移到
+       close 之前，并让 matplotlib 失败只打印警告、不破坏表格。
+    b. surrogate_summary 的 metric 名从 "surrogate_minus_shifted_pupil"
+       改为 "mi_excess"，与 condition_summary / sensitivity_summary 命名统一。
+
+====================================================================
+三、新增的辅助文件
+====================================================================
+f:\eye_eeg\ouhe\make_alignment_diagram.py   时间对齐示意图脚本（约 100 行）
+f:\eye_eeg\fig_time_alignment.png           输出图（180 dpi，三栏：EEG 网格 /
+                                            瞳孔网格与 ±0.5 s 容差 / 对齐结果）
+                                            图中标注：2 s 窗、1 s 步长、
+                                            中心 = k+1 s、缺口 >2 s 记无效。
+
+====================================================================
+四、验证记录
+====================================================================
+4.1 语法检查
+    python -c "ast.parse(...)" → syntax ok；文件 1917 行。
+
+4.2 旧实现逐元素对拍（修改 [12] 的验证）
+    用独立 for 循环重写原提交稿函数（z-score → digitize(linspace(min,max,10))
+    → histogram2d(bins=10) → Σp·log2(p/(pi·pj))），与脚本的向量化版本比较：
+      ref = [0.243529 0.239664 ...]   got = [0.243529 0.239664 ...]
+      maxdiff = 0.0
+    即 legacy_same_cohort 结果可视为旧实现的精确复原。
+
+4.3 两被试试跑（S01、S02）
+    命令：python mi_robustness_analysis.py run --out results_mi_smoke --subjects ...
+    产出 14 项交付 + 3 图 + 自检报告，无异常退出。
+    观察到的事实：
+      - S01 三条件共同有效点数 58，S02 为 99；
+      - S01 三条件共同通道 119 个，S02 仅 107 个（其正性视频
+        通道更少），说明"被试内共同通道集"确实因人而异，已逐人写入
+        channel_set_id；
+      - surrogate_summary 中 mi_excess 出现负值并原样保留（规范 L49）；
+      - 位置设置因 n_i=58 < n_position=80 被正确排除（33/38 会进入位置分析）；
+      - 两名被试的 TTS：r=19，n−2r=20≥n_min，θ 共 39 个，最小可达 p=0.05；
+        assumptions_supported=False（瞳孔序列按固定规则判为非平稳），
+        但 p 仍计算并同时写入状态位，未静默丢弃。
+
+4.4 自检（selfcheck_report.json，status=all_pass）
+    两被试试跑时耗时 0.4 s；全量 run 结束后重跑耗时 1.6 s，结果一致。
+    9 项全部 pass，其中可复核的数值：
+      三条件同点数 [58, 58, 58]
+      中心时间间隔 1 s 且首点 = 起始索引+1（negative 41.0 / neutral 0.0 /
+      positive 77.0 为各条件起点）
+      x/y/t 全部有限、长度一致，119 通道
+      区域均值复算：-0.024062074520 vs 存储 -0.024062074523（差 2e-12）
+      替代均值复算：0.001270768192 vs 0.001270768192（53 个不同移位）
+      mi_excess 复算：-0.025332842714 vs -0.025332842715
+      TTS：r=19，B=10，分母 20，θ 长度 39，n_points_used=20
+
+====================================================================
+五、全量运行（38 人 × 8 个设置）——已全部完成
+====================================================================
+命令：python mi_robustness_analysis.py run --out f:\eye_eeg\ouhe\results_mi
+第一次运行：2026-10-27 20:43 启动，已完成 native_equal、native_equal_k5，
+  在 native_equal_k10 进行中被外部终端抢占终止（非程序报错），结果已被
+  第二次运行覆盖重算。
+第二次运行：13:47:40 起算，14:08:34 结束，退出码 0，8 个设置全跑完。
+run_log.txt 原样：
+  [13:47:40] native_equal:            evaluable 38/38, excluded 0, elapsed 361.8s
+  [13:53:51] native_equal_k5:         evaluable 38/38, excluded 0, elapsed 371.7s
+  [14:00:10] native_equal_k10:        evaluable 38/38, excluded 0, elapsed 379.0s
+  [14:02:54] position_early:          evaluable 33/38, excluded 5, elapsed 163.6s
+  [14:05:37] position_middle:         evaluable 33/38, excluded 5, elapsed 162.9s
+  [14:08:22] position_late:           evaluable 33/38, excluded 5, elapsed 164.7s
+  [14:08:27] native_global_equal:     evaluable 38/38, excluded 0, elapsed   5.4s
+  [14:08:28] legacy_same_cohort:      evaluable 38/38, excluded 0, elapsed   1.4s
+  [14:08:28] position windows: 297 rows share an identical INDEX with another position
+  [14:08:32] sensitivity rows: 504
+  [14:08:34] done: 8 settings, 912 segment rows, 768 test rows, 1368 TTS rows, total 1634.1s
+全局长度：n_global = min(n_i) = 23 点（23 个时间点，跨 22 s，不是 23 s）
+自检：run 结束后重跑 selfcheck，status = all_pass，9 项全 pass，elapsed 1.6 s。
+说明：位置三设置各排除 5 人（n_i<80），且日志明确报告 297 行窗口的 INDEX
+      与另一位置相同，即前/中/后在 n_position=80 下落在同一段窗口，三者
+      数值完全相同，不构成三次独立验证（见第八节 8.4、第九节第 3 条）。
+
+====================================================================
+六、数据与样本事实（已核实，可直接用于文字说明二）
+====================================================================
+6.1 时间网格
+    EEG（SPRiNT）：WinLength=2 s、50% 重叠 → 步长 1 s；第 k 个参数点的
+    中心时刻 = k+1 s，支持区间 [k, k+2] s；日志"形状 (n_tp, 121)"中
+    121 = 0–60 Hz @0.5 Hz 的频率 bin 数，n_tp 才是时间点数
+    （各班次 v1 约 93/103/121，v2 约 177/285/356，v3 约 121/300/300）。
+    瞳孔：120 Hz 日志 + STFT（2 s 窗、50% 重叠、winaverage=0），
+    首点 ≈1.0010 s，步长 ≈1.0010 s；缺口最大 155.2 s，90 个文件存在
+    >2 s 的间隔。
+    对齐：目标网格 = EEG 中心 (k+1) s；|Δt|≤0.5 s 取最近实测样本；
+    否则若相邻实测点间隔 ≤2 s 做线性插值；>2 s 或超出观测范围记无效。
+    无效点不填补、不置 0，并且会切断"连续有效区间"（不做拼接）。
+
+6.2 从 97 人到可分析样本的漏斗
+    稿件（__docx_text.txt 第 285 行）：97 名 18 岁以下被试。
+    公开表 MIPDB_PublicFile.csv：126 行；Age<18 = 93；Age≤18 = 96。
+    （三个数字不一致，属口径差异，本文件如实列出，不凑成 97。）
+    EEG 参数（SPRiNT 日志）：42 人，其中三视频齐备 41 人。
+    眼动（瞳孔日志）：67 人，其中三视频齐备 43 人。
+    双模态三视频齐备：38 人 → 本轮全部分析的样本。
+    公开表标记"三视频齐备"的 18 岁以下被试为 44 人：
+      其中 9 人在本地交付目录里没有任何 SPRiNT/瞳孔日志；
+      本流水线 38 人中有 3 人在公开表里未被标记为齐备。
+      即公开可用性标记与本地文件在 12 人上不一致，本轮以本地文件为准。
+    长度门槛：38 人的 n_i 分布为 23–100（中位 99），全部 ≥ n_min=20；
+      位置敏感性需 n_i ≥ n_position=80 → 33 人（5 人排除）。
+    通道：111 通道批次 37 人、128 通道批次 1 人；被试内取三条件共同
+      通道；区域固定映射 119 个通道（前额 23、额 12、中央 26、顶 24、
+      颞 19、枕 15）。
+    参数拟合：KSG k=3 要求 n>3、k=10 要求 n≥11，n_i 最小 23，全部满足。
+
+6.3 原主分析 23 人 vs 其余 74 人
+    无法精确复原 23 人名单，证据：
+      - results_jingxi 下三个 pac_coupling_detailed_*.csv 均只剩 S03；
+      - 同目录配对检验 8 行全部 n_subjects=1 / not_evaluable；
+      - results_2\pac_region_video_stats.csv 的旧配对人数是 28/30/24；
+      - 稿件正文没有出现 "23"。
+    因此改用可复现的对照：本轮 38 人 vs 公开表中其余 55 名 18 岁以下被试
+      （93−38=55）：
+        年龄  12.05 ± 2.62（6–17） vs 11.51 ± 2.80（6–17）
+              Mann–Whitney U=1190，p=0.256
+        性别  27 男 / 11 女（女 28.9%） vs 27 男 / 28 女（女 50.9%）
+              χ²=3.60，p=0.058；Fisher 精确 p=0.054
+      结论：可分析样本年龄无差异；女性比例偏低，差异接近但未达 0.05。
+      若必须以 97 为分母，则 23 人对应 74 人，但该划分不可复核，
+      正文只能报告上述可复现对比，并注明 23 人名单不可复原。
+
+====================================================================
+七、产出清单（f:\eye_eeg\ouhe\results_mi\，共 26 个文件）
+====================================================================
+全量运行结束后目录内实际内容（大小为实测，行数含表头）：
+  analysis_config.json            4,990 B     98 行  分析配置
+  cohort_manifest.csv            30,390 B    305 行  304 人可用性 + 人口学
+  condition_summary.csv          91,787 B    577 行  条件汇总（主结果表）
+  condition_tests.csv           169,359 B    769 行  Friedman + Wilcoxon
+  console_run.txt                 1,014 B     13 行  控制台输出
+  coupling_channel_values.csv 18,296,698 B 185,899 行  通道级 MI 明细
+  coupling_values.csv         1,269,438 B  10,405 行  区域级 MI 明细
+  fig_segments_timeline.png      83,426 B     —      图1 片段时间轴
+  fig_sensitivity_forest.png     94,105 B     —      图3 敏感性森林图
+  fig_surrogate_position.png     61,100 B     —      图2 观测值在替代分布中的位置
+  inventory_eeg.csv              18,572 B    126 行  125 个 SPRiNT 日志 / 42 人
+  inventory_pupil.csv            23,256 B    171 行  170 个瞳孔日志 / 67 人
+  matched_channels.csv          176,195 B  4,079 行  通道配对明细
+  paired_inputs.npz           5,588,822 B     —      全部被试配对后的 x/y/t
+  probe_acf.csv                   3,362 B    115 行  瞳孔 ACF 衰减
+  probe_channels.csv             13,512 B     39 行  通道探针
+  probe_cohort.csv                3,738 B     43 行  队列探针
+  run_log.txt                       794 B     11 行  逐设置运行日志
+  segments.csv                  179,982 B    913 行  912 条片段窗口
+  selfcheck_report.json           1,805 B     78 行  9 项自检
+  sensitivity_summary.csv       151,014 B    505 行  504 条敏感性结果
+  surrogate_qc.csv              104,249 B    868 行  867 条移位集判据
+  surrogate_summary.csv       2,046,674 B 10,405 行  替代汇总与 mi_excess
+  surrogate_values.csv       48,762,569 B 586,405 行  全部替代原始值
+  tts_results.csv               227,340 B  1,369 行  1368 条 TTS 结果
+  tts_theta.csv               7,316,930 B 99,289 行  θ 分布明细
+另有 f:\eye_eeg\fig_time_alignment.png（时间对齐示意图，见第三节）。
+
+====================================================================
+八、结果在哪里：文件 → 实验对应表 + 核心数值
+====================================================================
+8.1 先看两个"是否真的跑成了"的凭据
+  run_log.txt            8 个设置的人次与耗时，末行 done: 8 settings,
+                         912 segment rows, 768 test rows, 1368 TTS rows,
+                         total 1634.1s（退出码 0）
+  selfcheck_report.json  status = all_pass，9 项全 pass，elapsed_s = 1.6
+                         规范 L205 要求的复算全部对上：
+                           三条件同点数 [58,58,58]
+                           中心间隔 1 s 且首点 = 索引+1
+                           区域均值复算 -0.024062074520 vs 存 -0.024062074523
+                           替代均值 53 个不同移位上复算差 2.6e-10
+                           mi_excess = 观测 − 替代均值
+                           TTS r=19 / B=10 / 分母=20 / n_theta=39
+
+8.2 实验一（等长片段 + 重算 MI）
+  segments.csv                 912 条：窗口起止、n_points、valid_fraction、
+                               min_shift_points、stationarity_supported、
+                               status/reason
+  coupling_values.csv         10404 条：区域级 MI 与 mi_excess
+  coupling_channel_values.csv 185898 条：通道级明细，可任意复算
+  condition_summary.csv        576 条：三条件 × 指标 × 区域 的均值±标准差，
+                               MI 与 mi_excess 并列 —— 引用数值看这一张
+  condition_tests.csv          768 条：Friedman + Kendall's W + 三组 Wilcoxon
+                               （bootstrap CI、BH 校正、状态位）
+  paired_inputs.npz            全部被试的配对后 x/y/t，可离线复算
+
+8.3 实验二（替代数据与 TTS）
+  surrogate_qc.csv       867 条：每个被试三条件各自的允许移位集与最小移位判定
+  surrogate_values.csv   586404 条：每个移位 × 区域的原始替代值
+  surrogate_summary.csv  10404 条：观测值、替代均值、mi_excess
+  tts_results.csv        1368 条：B / 分母 / p_tts / min_attainable_p /
+                         assumptions_supported / inference_status
+  tts_theta.csv          99288 条：θ 分布明细（d 从 -r 到 +r 含两端）
+
+8.4 实验三（敏感性）
+  sensitivity_summary.csv  504 条 = 7 个非基准设置 × 3 条件 × 2 参数 × 6 区域
+                           （与该设置内 n_subjects、baseline、BH 结果）
+
+8.5 三张图
+  fig_segments_timeline.png     每被试三条件有效区间 + 各设置窗口
+  fig_surrogate_position.png    观测 MI 在替代分布中的位置（红点）
+  fig_sensitivity_forest.png    各设置配对差值 + 95% CI 森林图
+
+8.6 核心统计数值（native_equal、KSG k=3、38 人）
+  exponent/frontal  mi_excess  Friedman  χ²=10.474, W=0.1378, p=0.005317
+  exponent/frontal  MI         Friedman  χ²= 6.789, W=0.0893, p=0.0335
+  offset/central    MI         Friedman  χ²= 4.789, p=0.0912（不显著）
+  其余参数×区域格 p>0.1
+
+  exponent/frontal 三组 Wilcoxon（MI，2000 次 bootstrap 中位数 95% CI）：
+    neg vs neu  +0.016759 bit  CI[0.008510, 0.023480]  p=0.000316  p_adj=0.011363
+    neu vs pos  -0.018948 bit  CI[-0.026745,-0.009763] p=0.001818  p_adj=0.021814
+    neg vs pos  -0.002562 bit                           p=0.490893（不显著）
+    mi_excess 方向与 MI 一致
+
+  量级判断：
+    KSG 观测 MI 仅 0.001–0.014 bit（negative 前额 0.00251、额 0.00857、
+    中央 0.00456、顶 0.00488、颞 0.00761、枕 0.00979；neutral 中央最大
+    0.01402；positive 前额 0.00732、顶 0.00095 最小，均为 mean±sd 的均值）
+    mi_excess 在 10404 条里 43.8%（4557 条）为负，按规范 L49 原样保留
+    native_equal 的 mi_excess 均值 0.000387、最小 -0.071729、负值占 50.0%
+    native_global_equal 最小 -0.169178、负值占 52.4%
+
+  敏感性（sensitivity_summary.csv，504 行、每设置 36 个可评估格）：
+    legacy_same_cohort    MI 36/36 显著，min p=7.28e-12，中位|差值|≈0.4785
+                          → 旧 10-bin 直方图比 KSG 高约 0.48 bit，两者不可混用
+    native_equal_k10      MI 9 显著 / mi_excess 1
+    native_equal_k5       MI 2 显著 / mi_excess 0
+    native_global_equal   MI 1 显著 / mi_excess 4
+    position_early/middle/late  各 MI 5 / mi_excess 2，且三者数值完全相同
+
+  TTS（1368 条）：
+    inference_status      {p_gt_alpha: 1318, p_le_alpha: 50}
+    assumptions_supported {False: 852, True: 516}
+    p_tts 中位 0.9545、最小 0.0244
+    min_attainable_p 取值 {0.05, 0.025, 0.027, 0.0244, 0.0256}
+    p≤0.05 的区域计数：offset 中央 7 / 前额 6 / 额 4 / 枕 4 / 颞 1；
+                        exponent 中央 5 / 额 4 / 枕 2 / 顶 1 / 前额 1
+
+  位置重复：n_position=80 下 297 行窗口 INDEX 与另一位置相同 →
+            duplicate_window=true，三设置不是独立验证。
+
+====================================================================
+九、尚未完成与已知限制
+====================================================================
+1. 原稿 48 项总体 + 144 项配对家族只做了 MI 部分：这两族在
+   condition_tests.csv 中标 family_pending、p_adjusted_orig 留空，
+   没有用 1 填充冒充完成（规范 L174）。即"家族校正"一项仍待补跑。
+2. 位置设置因 n_i<80 排除 5 人，敏感性结论只代表 33 人；且日志报 297 行
+   INDEX 重复，前/中/后三设置数值完全相同，不构成独立验证（见 8.6）。
+3. TTS 的 assumptions_supported 依据固定平稳性规则判定，852/1368 条为
+   False，多数瞳孔序列不满足前提；p 值仍保留并同时写状态位，解读时
+   不得把 p_tts 当主推断，也不能忽略该状态。
+4. 23 人名单不可复原（见 6.3），因此"23 vs 74"只能给出替代对比
+   （38 vs 55：年龄 p=0.256；性别 χ² p=0.058 / Fisher p=0.054）。
+5. 对齐只保证两信号共用同一相对时间索引，未建模视频开始到记录开始的
+   绝对偏移，不能声称毫秒级同步（配 fig_time_alignment.png）。
+6. 交付清单中尚无 requirements.txt / 依赖清单与运行命令说明的独立文件；
+   运行命令见第五节，控制台原始输出见 console_run.txt。

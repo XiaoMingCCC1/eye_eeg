@@ -1,0 +1,35 @@
+# 白名单式忽略：默认排除一切，只放行代码与说明文档。
+# 目的：避免把原始数据、被试人口学明细、第三方工具箱和论文原文提交到公开仓库。
+/*
+
+# --- 允许提交的仓库元文件 ---
+!/.gitignore
+!/README.md
+!/requirements.txt
+
+# --- 分析代码：MI 稳健性分析 ---
+!/ouhe/
+/ouhe/*
+!/ouhe/mi_robustness_analysis.py
+!/ouhe/make_alignment_diagram.py
+
+# --- 分析代码：PAC 耦合分析 ---
+!/ouhe/pac_coupling_analysis_real_data.py
+!/ouhe/pac_coupling_statistical_analysis.py
+!/ouhe/pac_region_pairwise_stats_violin.py
+!/ouhe/pac_revision_supplement.py
+!/eye_eeg_coupling_analysis.py
+
+# --- 分析代码：SPRiNT 参数拟合 ---
+!/SPRiNT_batch_process.py
+!/SPRiNT_py.py
+!/sprint_huatu.py
+!/gonglvpu.py
+
+# --- 说明文档 ---
+!/mi_robustness_analysis_protocol.md
+!/MI稳健性分析_修改与结果总结.txt
+!/文字说明_时间对齐验证与样本可用性.txt
+
+# --- 图 ---
+!/fig_time_alignment.png
